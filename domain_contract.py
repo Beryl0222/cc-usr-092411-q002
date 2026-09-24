@@ -3,10 +3,13 @@
 覆盖需求中的全部治理承诺：
 限时切片与脱敏、披露检查与小样本阻断、跨校到期收权、
 勘误/升级前向影响、同意撤回即时效力、已评分作业指纹冻结、
-教师复现与身份隔离、结论四要素溯源。
+教师复现与身份隔离、结论四要素溯源、版本登记幂等与冲突审计。
 """
 
+import json
+import threading
 import unittest
+from copy import deepcopy
 from datetime import datetime
 
 from domain import (
@@ -18,6 +21,7 @@ from domain import (
     AuthorizationError,
     Sandbox,
     SandboxError,
+    VersionConflict,
 )
 
 SEED = "fixtures/seed.json"
@@ -343,6 +347,452 @@ class TraceTest(unittest.TestCase):
                          {"AS-LIN-01", "AS-WANG-01", "AS-GAO-01"})
         self.assertEqual({row["course_id"] for row in listing},
                          {"C-LOCAL", "C-CROSS"})
+
+
+class SnapshotRegistrationTest(unittest.TestCase):
+    """版本登记：同版本异内容拒绝覆盖，完全一致才幂等重放，版本链显式引用。"""
+
+    IDENTITY = ["patient_id", "patient_name", "phone"]
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+
+    def _v1_payload(self):
+        snap = self.box.snapshots[("CASE-AML", 1)]
+        return {
+            "case_id": "CASE-AML", "version": 1,
+            "rows": deepcopy(snap["rows"]),
+            "identity_fields": list(snap["identity_fields"]),
+            "released_at": snap["released_at"],
+            "replaces": snap["replaces"],
+            "erratum_note": snap["erratum_note"],
+        }
+
+    def test_identical_replay_is_idempotent(self):
+        flags_before = {aid: deepcopy(a["risk_flags"])
+                        for aid, a in self.box.assignments.items()}
+        audit_before = len(self.box.audit)
+        record = self.box.add_snapshot(**self._v1_payload())
+        # 幂等重放：返回既有记录，账目不增、无冲突、无审计、无新风险标记
+        self.assertIs(record, self.box.snapshots[("CASE-AML", 1)])
+        self.assertEqual(len(self.box.snapshots), 2)
+        self.assertEqual(self.box.conflicts, [])
+        self.assertEqual(len(self.box.audit), audit_before)
+        for aid, flags in flags_before.items():
+            self.assertEqual(self.box.assignments[aid]["risk_flags"], flags)
+
+    def test_same_version_different_rows_rejected(self):
+        payload = self._v1_payload()
+        payload["rows"][2]["cell_type"] = "篡改细胞"
+        with self.assertRaises(VersionConflict) as ctx:
+            self.box.add_snapshot(**payload)
+        self.assertIn("数据行", ctx.exception.detail["differing_fields"])
+        # 原记录未被覆盖
+        self.assertEqual(self.box.snapshots[("CASE-AML", 1)]["rows"][2]["cell_type"],
+                         "早幼粒细胞")
+        # 冲突审计保留，且与异常指向同一条记录
+        conflicts = self.box.snapshot_conflicts("CASE-AML", 1)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["id"], ctx.exception.detail["conflict_id"])
+        self.assertTrue(any(entry["action"] == "版本冲突" for entry in self.box.audit))
+
+    def test_same_version_different_identity_fields_rejected(self):
+        payload = self._v1_payload()
+        payload["identity_fields"] = ["patient_id", "patient_name"]  # 少了 phone
+        with self.assertRaises(VersionConflict) as ctx:
+            self.box.add_snapshot(**payload)
+        self.assertIn("身份字段", ctx.exception.detail["differing_fields"])
+        self.assertEqual(self.box.snapshots[("CASE-AML", 1)]["identity_fields"],
+                         self.IDENTITY)
+
+    def test_same_version_different_released_at_rejected(self):
+        payload = self._v1_payload()
+        payload["released_at"] = T("2026-02-21T00:00:00")
+        with self.assertRaises(VersionConflict) as ctx:
+            self.box.add_snapshot(**payload)
+        self.assertIn("发布时间", ctx.exception.detail["differing_fields"])
+        self.assertEqual(self.box.snapshots[("CASE-AML", 1)]["released_at"],
+                         T("2026-02-20T00:00:00"))
+
+    def test_same_version_different_lineage_or_note_rejected(self):
+        # 版本链声明不同也算异内容
+        payload = self._v1_payload()
+        payload["replaces"] = 0
+        with self.assertRaises(VersionConflict) as ctx:
+            self.box.add_snapshot(**payload)
+        self.assertIn("版本链", ctx.exception.detail["differing_fields"])
+        # 勘误说明不同同样拒绝
+        snap2 = self.box.snapshots[("CASE-AML", 2)]
+        with self.assertRaises(VersionConflict) as ctx2:
+            self.box.add_snapshot(
+                "CASE-AML", 2, deepcopy(snap2["rows"]), self.IDENTITY,
+                snap2["released_at"], replaces=1, erratum_note="改写后的说明")
+        self.assertIn("勘误说明", ctx2.exception.detail["differing_fields"])
+        self.assertNotEqual(self.box.snapshots[("CASE-AML", 2)]["erratum_note"],
+                            "改写后的说明")
+
+    def test_error_response_states_frozen_fingerprint_and_conflict(self):
+        payload = self._v1_payload()
+        payload["rows"][2]["cell_type"] = "篡改细胞"
+        with self.assertRaises(VersionConflict) as ctx:
+            self.box.add_snapshot(**payload)
+        response = ctx.exception.as_response()
+        frozen = self.box.assignments["AS-LIN-01"]["fingerprint"]["snapshot"]
+        # 服务错误响应同时说明：冲突来源、既有内容（=成绩冻结指纹）与登记内容
+        self.assertEqual(response["error"], "版本冲突")
+        self.assertEqual(response["key"], {"case_id": "CASE-AML", "version": 1})
+        self.assertEqual(response["existing"]["content_hash"], frozen["content_hash"])
+        self.assertNotEqual(response["incoming"]["content_hash"],
+                            frozen["content_hash"])
+        self.assertIn("数据行", response["differing_fields"])
+
+    def test_rejected_overwrite_keeps_trace_and_reproduce_coherent(self):
+        payload = self._v1_payload()
+        payload["rows"][0]["age"] = 99
+        with self.assertRaises(VersionConflict) as ctx:
+            self.box.add_snapshot(**payload)
+        conflict_id = ctx.exception.detail["conflict_id"]
+        # 教师复现：实际读取仍是被冻结的 v1 内容，复现一致
+        report = self.box.reproduce_report("T-CHEN", "AS-LIN-01",
+                                           T("2026-05-20T00:00:00"))
+        self.assertEqual(report["status"], "复现一致")
+        self.assertTrue(report["read_matches_frozen"])
+        self.assertEqual(report["actual_read"]["snapshot"]["content_hash"],
+                         report["frozen_fingerprint"]["snapshot"]["content_hash"])
+        self.assertEqual([c["id"] for c in report["conflicts"]], [conflict_id])
+        # 追溯：两门课程的已评分作业共同指向同一实际读取与冲突来源
+        for aid in ("AS-LIN-01", "AS-GAO-01"):
+            trace = self.box.trace(aid)
+            self.assertEqual([c["id"] for c in trace["版本冲突"]], [conflict_id])
+            self.assertEqual(trace["数据范围"]["content_hash"],
+                             trace["fingerprint"]["snapshot"]["content_hash"])
+            self.assertEqual(trace["数据范围"]["released_at"], "2026-02-20T00:00:00")
+
+    def test_new_version_must_explicitly_replace_latest(self):
+        rows = deepcopy(self.box.snapshots[("CASE-AML", 2)]["rows"])
+        # 缺 replaces：不允许静默沿用版本链之外的方式发布
+        with self.assertRaises(SandboxError):
+            self.box.add_snapshot("CASE-AML", 3, rows, self.IDENTITY,
+                                  T("2026-06-01T00:00:00"))
+        # replaces 指向非当前最新版本：拒绝
+        with self.assertRaises(SandboxError):
+            self.box.add_snapshot("CASE-AML", 3, rows, self.IDENTITY,
+                                  T("2026-06-01T00:00:00"), replaces=1)
+        # 首个版本不得声明替代关系
+        with self.assertRaises(SandboxError):
+            self.box.add_snapshot("CASE-T2D", 1, [], [],
+                                  T("2026-06-01T00:00:00"), replaces=1)
+        # 显式引用当前最新版本的勘误被接受
+        record = self.box.add_snapshot("CASE-AML", 3, rows, self.IDENTITY,
+                                       T("2026-06-01T00:00:00"), replaces=2,
+                                       erratum_note="v3 勘误")
+        self.assertEqual(record["replaces"], 2)
+        self.assertEqual(self.box.snapshots[("CASE-AML", 3)], record)
+
+    def test_erratum_flags_graded_assignments_in_both_courses(self):
+        rows = deepcopy(self.box.snapshots[("CASE-AML", 2)]["rows"])
+        rows[6]["marker"] = "CD64+/CD36+"
+        self.box.add_snapshot("CASE-AML", 3, rows, self.IDENTITY,
+                              T("2026-06-01T00:00:00"), replaces=2,
+                              erratum_note="P-007 标记复核")
+        # 跨课程：本校与跨校两门课的已评分作业都收到勘误标记
+        for aid in ("AS-LIN-01", "AS-GAO-01"):
+            flags = self.box.assignments[aid]["risk_flags"]
+            self.assertTrue(any(f["type"] == "病例勘误" and f["current_version"] == 3
+                                for f in flags))
+        # 未评分作业不打标
+        self.assertFalse(any(f.get("current_version") == 3
+                             for f in self.box.assignments["AS-WANG-01"]["risk_flags"]))
+        # 已创建任务与已评分作业继续使用原不可变内容
+        self.assertEqual(self.box.tasks["TASK-LOCAL-Q1"]["snapshot_version"], 1)
+        self.assertEqual(self.box.tasks["TASK-LOCAL-Q2"]["snapshot_version"], 2)
+        self.assertEqual(
+            self.box.assignments["AS-LIN-01"]["fingerprint"]["snapshot"]["version"], 1)
+        # 新任务创建时才钉到最新版
+        task = self.box.create_task("TASK-NEW", "C-LOCAL", "CASE-AML",
+                                    ["diagnosis"], "POL-K5", "ENV-SCANPY",
+                                    now=T("2026-06-02T09:00:00"))
+        self.assertEqual(task["snapshot_version"], 3)
+
+
+class EnvironmentRegistrationTest(unittest.TestCase):
+    """分析环境版本登记：工具清单异内容拒绝、显式版本链、升级前向标记。"""
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+
+    def _v1_env(self):
+        return self.box.environment_versions[("ENV-SCANPY", 1)]
+
+    def test_identical_environment_replay_is_idempotent(self):
+        env = self._v1_env()
+        before = len(self.box.environment_versions)
+        record = self.box.add_environment(
+            "ENV-SCANPY", 1, deepcopy(env["tools"]),
+            released_at=env["released_at"], note=env["note"])
+        self.assertIs(record, env)
+        self.assertEqual(len(self.box.environment_versions), before)
+        self.assertEqual(self.box.conflicts, [])
+
+    def test_same_version_different_tools_rejected(self):
+        env = self._v1_env()
+        with self.assertRaises(VersionConflict) as ctx:
+            self.box.add_environment("ENV-SCANPY", 1,
+                                     dict(env["tools"], scanpy="1.9.9"),
+                                     released_at=env["released_at"])
+        self.assertIn("工具清单", ctx.exception.detail["differing_fields"])
+        # 原记录未被覆盖
+        self.assertEqual(self._v1_env()["tools"]["scanpy"], "1.9.8")
+        self.assertEqual(len(self.box.environment_conflicts("ENV-SCANPY", 1)), 1)
+        # 发布时间变化同样拒绝
+        with self.assertRaises(VersionConflict):
+            self.box.add_environment("ENV-SCANPY", 1, deepcopy(env["tools"]),
+                                     released_at=T("2026-02-02T00:00:00"))
+        self.assertEqual(len(self.box.environment_conflicts("ENV-SCANPY", 1)), 2)
+
+    def test_tool_upgrade_requires_chain_and_flags_forward(self):
+        # 在钉住 env v2 的任务上产出一份已评分作业
+        now = T("2026-05-12T09:00:00")
+        session = self.box.issue_slice("S-LIN", "TASK-LOCAL-Q2", now)
+        self.box.submit_assignment(
+            "AS-UPG", "S-LIN", "TASK-LOCAL-Q2", "基于 v2 环境的差异表达结论",
+            [{"step": "差异表达检验", "tool": "scanpy"}], now,
+            slice_ids=[session["id"]])
+        self.box.grade_assignment("T-CHEN", "AS-UPG", "B", "通过",
+                                  T("2026-05-13T10:00:00"))
+        tools_v3 = {"python": "3.11.9", "scanpy": "1.11.0", "pandas": "2.2.2"}
+        # 缺 replaces 的升级被拒绝
+        with self.assertRaises(SandboxError):
+            self.box.add_environment("ENV-SCANPY", 3, tools_v3,
+                                     released_at=T("2026-05-20T00:00:00"))
+        self.box.add_environment("ENV-SCANPY", 3, tools_v3,
+                                 released_at=T("2026-05-20T00:00:00"),
+                                 note="scanpy 1.11", replaces=2)
+        # 钉 v2 的作业收到升级标记；钉 v1 的已评分作业同样前向标记
+        self.assertTrue(any(
+            f["type"] == "工具升级" and f["current"] == "ENV-SCANPY:v3"
+            for f in self.box.assignments["AS-UPG"]["risk_flags"]))
+        self.assertTrue(any(
+            f["type"] == "工具升级" and f["current"] == "ENV-SCANPY:v3"
+            for f in self.box.assignments["AS-LIN-01"]["risk_flags"]))
+        # 幂等重放 v3：不重复打标、不产生冲突
+        counts = {aid: len(a["risk_flags"])
+                  for aid, a in self.box.assignments.items()}
+        self.box.add_environment("ENV-SCANPY", 3, tools_v3,
+                                 released_at=T("2026-05-20T00:00:00"),
+                                 note="scanpy 1.11", replaces=2)
+        self.assertEqual({aid: len(a["risk_flags"])
+                          for aid, a in self.box.assignments.items()}, counts)
+        self.assertEqual(self.box.conflicts, [])
+        # 既有任务仍钉原版本
+        self.assertEqual(self.box.tasks["TASK-LOCAL-Q2"]["environment_version"], 2)
+
+
+class BatchRegistrationTest(unittest.TestCase):
+    """批量登记原子性：冲突则整批回滚，不留部分版本或错误风险标记。"""
+
+    IDENTITY = ["patient_id", "patient_name", "phone"]
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+
+    def _v3_item(self):
+        rows = deepcopy(self.box.snapshots[("CASE-AML", 2)]["rows"])
+        rows[0]["marker"] = "CD34-"
+        return {"case_id": "CASE-AML", "version": 3, "rows": rows,
+                "identity_fields": list(self.IDENTITY),
+                "released_at": T("2026-06-01T00:00:00"), "replaces": 2,
+                "erratum_note": "v3 批量勘误"}
+
+    def test_conflicting_batch_leaves_no_partial_versions_or_flags(self):
+        snap2 = self.box.snapshots[("CASE-AML", 2)]
+        bad_v2 = {"case_id": "CASE-AML", "version": 2,
+                  "rows": deepcopy(snap2["rows"]),
+                  "identity_fields": list(self.IDENTITY),
+                  "released_at": snap2["released_at"], "replaces": 1,
+                  "erratum_note": snap2["erratum_note"]}
+        bad_v2["rows"][2]["cell_type"] = "篡改细胞"  # 与既有 v2 异内容
+        flags_before = {aid: deepcopy(a["risk_flags"])
+                        for aid, a in self.box.assignments.items()}
+        with self.assertRaises(VersionConflict):
+            self.box.register_snapshots([self._v3_item(), bad_v2])
+        # 整批回滚：合法的 v3 也未落账
+        self.assertNotIn(("CASE-AML", 3), self.box.snapshots)
+        # 不留下错误风险标记
+        for aid, flags in flags_before.items():
+            self.assertEqual(self.box.assignments[aid]["risk_flags"], flags)
+        # 冲突审计保留
+        conflicts = self.box.snapshot_conflicts("CASE-AML", 2)
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("数据行", conflicts[0]["differing_fields"])
+
+    def test_batch_chain_commits_atomically(self):
+        v3 = self._v3_item()
+        v4_rows = deepcopy(v3["rows"])
+        v4_rows[1]["marker"] = "CD34-"
+        v4 = {"case_id": "CASE-AML", "version": 4, "rows": v4_rows,
+              "identity_fields": list(self.IDENTITY),
+              "released_at": T("2026-06-03T00:00:00"), "replaces": 3,
+              "erratum_note": "v4 复核"}
+        records = self.box.register_snapshots([v3, v4])
+        self.assertEqual([r["version"] for r in records], [3, 4])
+        self.assertIn(("CASE-AML", 4), self.box.snapshots)
+        # 已评分作业收到 v3、v4 两条前向勘误标记
+        versions = {f.get("current_version")
+                    for f in self.box.assignments["AS-LIN-01"]["risk_flags"]
+                    if f["type"] == "病例勘误"}
+        self.assertTrue({2, 3, 4} <= versions)
+
+    def test_environment_batch_rolls_back_on_conflict(self):
+        good_v3 = {"id": "ENV-SCANPY", "version": 3,
+                   "tools": {"python": "3.11.9", "scanpy": "1.11.0",
+                             "pandas": "2.2.2"},
+                   "released_at": T("2026-06-01T00:00:00"),
+                   "note": "升级", "replaces": 2}
+        bad_v1 = {"id": "ENV-SCANPY", "version": 1,
+                  "tools": {"python": "3.12.0", "scanpy": "1.9.8",
+                            "pandas": "2.2.1"},
+                  "released_at": T("2026-02-01T00:00:00"),
+                  "note": "春季学期初标准镜像", "replaces": None}
+        with self.assertRaises(VersionConflict):
+            self.box.register_environments([good_v3, bad_v1])
+        self.assertNotIn(("ENV-SCANPY", 3), self.box.environment_versions)
+        self.assertEqual(
+            self.box.environment_versions[("ENV-SCANPY", 1)]["tools"]["python"],
+            "3.11.9")
+        self.assertEqual(len(self.box.environment_conflicts("ENV-SCANPY", 1)), 1)
+
+
+class ConcurrentRegistrationTest(unittest.TestCase):
+    """并发上传同一 (标识, 版本)：得到唯一结果。"""
+
+    THREADS = 8
+    IDENTITY = ["patient_id", "patient_name", "phone"]
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+
+    def _run_concurrently(self, fn):
+        barrier = threading.Barrier(self.THREADS)
+
+        def worker(i):
+            barrier.wait(timeout=5)
+            fn(i)
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(self.THREADS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+    def test_concurrent_conflicting_uploads_yield_single_winner(self):
+        base_rows = deepcopy(self.box.snapshots[("CASE-AML", 2)]["rows"])
+        wins, losses = [], []
+
+        def upload(i):
+            rows = deepcopy(base_rows)
+            rows[0]["age"] = 40 + i  # 各上传者内容互不相同
+            try:
+                self.box.add_snapshot("CASE-AML", 3, rows, self.IDENTITY,
+                                      T("2026-06-01T00:00:00"), replaces=2,
+                                      erratum_note=f"并发上传 {i}")
+                wins.append(i)
+            except VersionConflict:
+                losses.append(i)
+
+        self._run_concurrently(upload)
+        # 唯一结果：恰好一个胜出，其余全部冲突拒绝
+        self.assertEqual(len(wins), 1)
+        self.assertEqual(len(losses), self.THREADS - 1)
+        self.assertEqual(len(self.box.snapshot_conflicts("CASE-AML", 3)),
+                         self.THREADS - 1)
+        self.assertEqual(self.box.snapshots[("CASE-AML", 3)]["rows"][0]["age"],
+                         40 + wins[0])
+        ids = [c["id"] for c in self.box.conflicts]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_concurrent_identical_uploads_all_replay(self):
+        rows = deepcopy(self.box.snapshots[("CASE-AML", 2)]["rows"])
+        results = []
+
+        def upload(_i):
+            results.append(self.box.add_snapshot(
+                "CASE-AML", 3, deepcopy(rows), self.IDENTITY,
+                T("2026-06-01T00:00:00"), replaces=2, erratum_note="相同内容"))
+
+        self._run_concurrently(upload)
+        # 全部按幂等重放成功，账上只有一条记录，无冲突
+        self.assertEqual(len(results), self.THREADS)
+        self.assertTrue(all(r is self.box.snapshots[("CASE-AML", 3)]
+                            for r in results))
+        self.assertEqual(self.box.conflicts, [])
+
+
+class ProcessRecoveryTest(unittest.TestCase):
+    """进程恢复：状态导出后再装载，账本、风险标记、指纹与冲突审计一致。"""
+
+    IDENTITY = ["patient_id", "patient_name", "phone"]
+
+    def _exercised_box(self):
+        box = Sandbox.from_seed(SEED)
+        box.withdraw_consent("CONS-AML-TEACH", T("2026-05-05T12:00:00"))
+        rows3 = deepcopy(box.snapshots[("CASE-AML", 2)]["rows"])
+        rows3[6]["marker"] = "CD64+/CD36+"
+        box.add_snapshot("CASE-AML", 3, rows3, self.IDENTITY,
+                         T("2026-06-01T00:00:00"), replaces=2,
+                         erratum_note="P-007 标记复核")
+        box.add_environment("ENV-SCANPY", 3,
+                            {"python": "3.11.9", "scanpy": "1.11.0",
+                             "pandas": "2.2.2"},
+                            released_at=T("2026-06-02T00:00:00"),
+                            note="scanpy 1.11", replaces=2)
+        tampered = deepcopy(box.snapshots[("CASE-AML", 1)]["rows"])
+        tampered[0]["age"] = 99
+        with self.assertRaises(VersionConflict):
+            box.add_snapshot("CASE-AML", 1, tampered, self.IDENTITY,
+                             T("2026-02-20T00:00:00"), now=T("2026-06-05T09:00:00"))
+        return box
+
+    def test_dump_reload_preserves_ledgers_flags_and_conflicts(self):
+        box = self._exercised_box()
+        state = json.loads(json.dumps(box.dump_state(), ensure_ascii=False))  # 模拟落盘
+        revived = Sandbox.from_state(state)
+        # 六账与审计一致
+        self.assertEqual(revived.snapshots, box.snapshots)
+        self.assertEqual(revived.environment_versions, box.environment_versions)
+        self.assertEqual(revived.consents, box.consents)
+        self.assertEqual(revived.conflicts, box.conflicts)
+        self.assertEqual(revived.audit, box.audit)
+        for aid, assignment in box.assignments.items():
+            restored = revived.assignments[aid]
+            self.assertEqual(restored["status"], assignment["status"])
+            self.assertEqual(restored["fingerprint"], assignment["fingerprint"])
+            self.assertEqual(restored["risk_flags"], assignment["risk_flags"])
+        # 恢复后复现仍一致，冲突来源仍指向同一条审计
+        report = revived.reproduce_report("T-CHEN", "AS-LIN-01",
+                                          T("2026-06-10T00:00:00"))
+        self.assertEqual(report["status"], "复现一致")
+        self.assertTrue(report["read_matches_frozen"])
+        self.assertEqual([c["id"] for c in report["conflicts"]],
+                         [c["id"] for c in revived.snapshot_conflicts("CASE-AML", 1)])
+        # 恢复后继续拒绝同版本异内容，且冲突编号不与恢复前重复
+        tampered = deepcopy(revived.snapshots[("CASE-AML", 1)]["rows"])
+        tampered[1]["age"] = 98
+        with self.assertRaises(VersionConflict) as ctx:
+            revived.add_snapshot("CASE-AML", 1, tampered, self.IDENTITY,
+                                 T("2026-02-20T00:00:00"),
+                                 now=T("2026-06-11T09:00:00"))
+        self.assertNotIn(ctx.exception.detail["conflict_id"],
+                         [c["id"] for c in box.conflicts])
+        self.assertEqual(revived.snapshots[("CASE-AML", 1)]["rows"][1]["age"], 45)
+
+    def test_dump_is_deterministic(self):
+        box = self._exercised_box()
+        first = json.dumps(box.dump_state(), ensure_ascii=False, sort_keys=True)
+        revived = Sandbox.from_state(json.loads(first))
+        second = json.dumps(revived.dump_state(), ensure_ascii=False, sort_keys=True)
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

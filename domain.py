@@ -19,7 +19,10 @@
 4. 跨校课程到期后，注册关系与沙箱会话自动收回；
 5. 病例勘误、工具升级只影响之后创建的新任务；已评分作业保留当时环境指纹，
    另以风险标记标出后续变化；同意撤回则即时阻断相关导出并撤回会话；
-6. 任一结论都可溯源到：数据范围、处理步骤、课程授权、教师复核四部分。
+6. 任一结论都可溯源到：数据范围、处理步骤、课程授权、教师复核四部分；
+7. 快照与环境版本登记幂等：同一业务标识与版本只接受内容完全一致的幂等重放，
+   数据、身份字段、发布时间或工具清单有任何差异都拒绝覆盖并保留冲突审计；
+   新版本必须显式 replaces 当前最新版本；批量登记原子落账；并发登记结果唯一。
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import threading
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -56,6 +61,27 @@ class AuthorizationError(SandboxError):
     """身份不具备所需能力，或授权已失效。"""
 
 
+class VersionConflict(SandboxError):
+    """同一业务标识与版本的登记内容与既有记录不一致，覆盖被拒绝。
+
+    ``detail`` 结构化说明冲突来源：业务键、差异字段、既有与登记内容的摘要，
+    并指向冲突审计记录；``as_response`` 供服务层直接作为错误响应体返回。
+    """
+
+    def __init__(self, message: str, detail: dict) -> None:
+        super().__init__(message)
+        self.detail = {**detail, "message": message}
+
+    def as_response(self) -> dict:
+        """服务错误响应：冲突来源、既有内容与登记内容各自的内容摘要。"""
+        return {"error": "版本冲突", **self.detail}
+
+
+# 版本冲突审计的账别词汇
+KIND_SNAPSHOT = "临床数据快照"
+KIND_ENVIRONMENT = "分析环境"
+
+
 def parse_time(value: str) -> datetime:
     """解析夹具中的 ISO 时间。"""
     return datetime.fromisoformat(value)
@@ -68,6 +94,74 @@ def canon(value: Any) -> str:
 
 def digest(value: Any, length: int = 16) -> str:
     return hashlib.sha256(canon(value).encode("utf-8")).hexdigest()[:length]
+
+
+def _snapshot_registration_hash(record: dict) -> str:
+    """快照登记内容摘要：数据行、身份字段、发布时间、版本链与勘误说明。"""
+    return digest({
+        "rows": record["rows"],
+        "identity_fields": sorted(record["identity_fields"]),
+        "released_at": record["released_at"].isoformat(),
+        "replaces": record["replaces"],
+        "erratum_note": record["erratum_note"],
+    })
+
+
+def _environment_registration_hash(record: dict) -> str:
+    """环境登记内容摘要：工具清单、发布时间、备注与版本链。"""
+    return digest({
+        "tools": record["tools"],
+        "released_at": record["released_at"].isoformat(),
+        "note": record["note"],
+        "replaces": record["replaces"],
+    })
+
+
+def _snapshot_diff(existing: dict, incoming: dict) -> list[str]:
+    """逐项比对既有快照与登记内容，返回差异字段（中文标签）。"""
+    diff = []
+    if existing["rows"] != incoming["rows"]:
+        diff.append("数据行")
+    # 身份字段是集合语义，顺序差异不算内容变化
+    if sorted(existing["identity_fields"]) != sorted(incoming["identity_fields"]):
+        diff.append("身份字段")
+    if existing["released_at"] != incoming["released_at"]:
+        diff.append("发布时间")
+    if existing["replaces"] != incoming["replaces"]:
+        diff.append("版本链")
+    if existing["erratum_note"] != incoming["erratum_note"]:
+        diff.append("勘误说明")
+    return diff
+
+
+def _environment_diff(existing: dict, incoming: dict) -> list[str]:
+    """逐项比对既有环境版本与登记内容，返回差异字段（中文标签）。"""
+    diff = []
+    if existing["tools"] != incoming["tools"]:
+        diff.append("工具清单")
+    if existing["released_at"] != incoming["released_at"]:
+        diff.append("发布时间")
+    if existing["note"] != incoming["note"]:
+        diff.append("备注")
+    if existing["replaces"] != incoming["replaces"]:
+        diff.append("版本链")
+    return diff
+
+
+def _snapshot_summary(record: dict) -> dict:
+    return {
+        "content_hash": record["content_hash"],
+        "registration_hash": _snapshot_registration_hash(record),
+        "released_at": record["released_at"].isoformat(),
+    }
+
+
+def _environment_summary(record: dict) -> dict:
+    return {
+        "digest": record["digest"],
+        "registration_hash": _environment_registration_hash(record),
+        "released_at": record["released_at"].isoformat(),
+    }
 
 
 def _apply_transform(value: Any, rule: str) -> Any:
@@ -88,7 +182,8 @@ class Sandbox:
         self.actors: dict[str, dict] = {}
         self.courses: dict[str, dict] = {}
         self.cases: dict[str, dict] = {}
-        # 快照按 (病例, 版本) 存放，任何版本一经发布不可改写
+        # 快照按 (病例, 版本) 存放，任何版本一经发布不可改写；
+        # 同版本仅接受内容完全一致的幂等重放，异内容拒绝覆盖并留冲突审计
         self.snapshots: dict[tuple[str, int], dict] = {}
         self.consents: dict[str, dict] = {}
         self.policies: dict[str, dict] = {}
@@ -101,6 +196,10 @@ class Sandbox:
         self.enrollments: list[dict] = []
         self.teacher_courses: list[dict] = []
         self.audit: list[dict] = []
+        # 版本冲突审计账：被拒绝的覆盖尝试逐条留痕，供追溯/复现/错误响应引用
+        self.conflicts: list[dict] = []
+        # 版本登记串行化：并发上传同一 (标识, 版本) 得到唯一结果
+        self._lock = threading.RLock()
         self._seq = 0
 
     # ---- 装载 -----------------------------------------------------------
@@ -109,6 +208,11 @@ class Sandbox:
     def from_seed(cls, path: str | Path) -> "Sandbox":
         """从种子夹具装载一个可联调的沙箱。"""
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_state(data)
+
+    @classmethod
+    def from_state(cls, data: dict) -> "Sandbox":
+        """从状态字典装载沙箱（种子夹具或 :meth:`dump_state` 的产出）。"""
         box = cls()
         for actor in data.get("actors", []):
             box.actors[actor["id"]] = dict(actor)
@@ -130,6 +234,7 @@ class Sandbox:
             box.add_environment(
                 env["id"], env["version"], env["tools"],
                 released_at=parse_time(env["released_at"]), note=env.get("note", ""),
+                replaces=env.get("replaces"),
             )
         for snapshot in data.get("snapshots", []):
             box.add_snapshot(
@@ -146,6 +251,8 @@ class Sandbox:
                 granted_at=parse_time(grant["granted_at"]),
                 scope_note=grant.get("scope_note", ""),
             )
+            if grant.get("withdrawn_at"):
+                box.consents[grant["id"]]["withdrawn_at"] = parse_time(grant["withdrawn_at"])
         for enrollment in data.get("enrollments", []):
             box.enroll(enrollment["student_id"], enrollment["course_id"],
                        status=enrollment.get("status"))
@@ -160,6 +267,10 @@ class Sandbox:
             )
         for assignment in data.get("assignments", []):
             box._load_assignment(assignment)
+        # 进程恢复：冲突审计、统一审计账与序号发生器一并还原
+        box.conflicts = deepcopy(data.get("conflicts", []))
+        box.audit = deepcopy(data.get("audit", []))
+        box._seq = int(data.get("_seq", 0))
         box._reconcile_flags()
         return box
 
@@ -265,64 +376,243 @@ class Sandbox:
             "courses": list(courses or []),
         }
 
+    # ---- 版本登记：幂等重放、显式版本链、冲突审计、批量原子 --------------
+
     def add_snapshot(self, case_id: str, version: int, rows: list[dict],
                      identity_fields: list[str], released_at: datetime,
                      replaces: Optional[int] = None,
-                     erratum_note: str = "") -> dict:
+                     erratum_note: str = "",
+                     now: Optional[datetime] = None) -> dict:
+        """登记单个快照版本（等价于单件批量登记）。
+
+        同一 (病例, 版本) 只接受内容完全一致的幂等重放；数据行、身份字段、
+        发布时间、版本链或勘误说明有任何差异都拒绝覆盖并保留冲突审计。
+        """
+        return self.register_snapshots([{
+            "case_id": case_id, "version": version, "rows": rows,
+            "identity_fields": identity_fields, "released_at": released_at,
+            "replaces": replaces, "erratum_note": erratum_note,
+        }], now=now)[0]
+
+    def register_snapshots(self, batch: list[dict],
+                           now: Optional[datetime] = None) -> list[dict]:
+        """批量登记快照版本：整批校验通过才落账，任一冲突则整批拒绝。
+
+        冲突发生时不留下部分版本或错误风险标记，但冲突本身写入审计账；
+        并发登记由锁串行化，同一 (病例, 版本) 得到唯一结果。
+        """
+        with self._lock:
+            staged = dict(self.snapshots)
+            committed: list[dict] = []
+            results: list[dict] = []
+            for item in batch:
+                record, is_new = self._prepare_snapshot(staged, item, now)
+                if is_new:
+                    staged[(record["case_id"], record["version"])] = record
+                    committed.append(record)
+                results.append(record)
+            # 全部通过才统一落账、统一追加风险标记
+            for record in committed:
+                self.snapshots[(record["case_id"], record["version"])] = record
+            for record in committed:
+                self._flag_erratum(record)
+            return results
+
+    def _prepare_snapshot(self, staged: dict, item: dict,
+                          now: Optional[datetime]) -> tuple[dict, bool]:
+        """在暂存账视图上校验一个快照登记，返回 (记录, 是否新版本)。"""
+        case_id = item["case_id"]
+        version = item["version"]
         if case_id not in self.cases:
             raise NotFound(f"未知病例：{case_id}")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise SandboxError(f"快照版本号必须为正整数：{version!r}")
+        released_at = item["released_at"]
+        if isinstance(released_at, str):
+            released_at = parse_time(released_at)
         record = {
             "case_id": case_id,
             "version": version,
-            "rows": rows,
-            "identity_fields": identity_fields,
+            "rows": deepcopy(item["rows"]),
+            "identity_fields": list(item.get("identity_fields", [])),
             "released_at": released_at,
-            "replaces": replaces,
-            "erratum_note": erratum_note,
-            "content_hash": digest(rows),
+            "replaces": item.get("replaces"),
+            "erratum_note": item.get("erratum_note", ""),
+            "content_hash": digest(item["rows"]),
         }
-        self.snapshots[(case_id, version)] = record
-        # 新版本发布：给引用旧版本的已评分作业追加风险标记
-        if replaces is not None:
-            for assignment in self.assignments.values():
-                fp = assignment.get("fingerprint")
-                if (fp and fp["snapshot"]["case_id"] == case_id
-                        and fp["snapshot"]["version"] == replaces):
-                    self._flag(assignment, {
-                        "type": "病例勘误",
-                        "at": released_at.isoformat(),
-                        "detail": erratum_note or f"病例已发布 v{version}，结论基于 v{replaces}",
-                        "current_version": version,
-                    })
-        return record
+        existing = staged.get((case_id, version))
+        if existing is not None:
+            diff = _snapshot_diff(existing, record)
+            if not diff:
+                return existing, False  # 内容完全一致的幂等重放
+            conflict = self._record_conflict(
+                KIND_SNAPSHOT, {"case_id": case_id, "version": version},
+                _snapshot_summary(existing), _snapshot_summary(record), diff, now)
+            raise VersionConflict(
+                f"病例 {case_id} 快照 v{version} 已存在，登记内容不一致"
+                f"（差异：{'、'.join(diff)}）；已拒绝覆盖，冲突审计 {conflict['id']}",
+                self._conflict_detail(conflict))
+        self._check_version_chain(staged, case_id, version, record["replaces"],
+                                  f"病例 {case_id} 快照")
+        return record, True
 
     def add_environment(self, env_id: str, version: int, tools: dict[str, str],
-                        released_at: datetime, note: str = "") -> dict:
+                        released_at: datetime, note: str = "",
+                        replaces: Optional[int] = None,
+                        now: Optional[datetime] = None) -> dict:
+        """登记单个分析环境版本（等价于单件批量登记）。
+
+        同一 (镜像, 版本) 只接受内容完全一致的幂等重放；工具清单、发布时间、
+        备注或版本链有任何差异都拒绝覆盖并保留冲突审计。
+        """
+        return self.register_environments([{
+            "id": env_id, "version": version, "tools": tools,
+            "released_at": released_at, "note": note, "replaces": replaces,
+        }], now=now)[0]
+
+    def register_environments(self, batch: list[dict],
+                              now: Optional[datetime] = None) -> list[dict]:
+        """批量登记环境版本：整批校验通过才落账，任一冲突则整批拒绝。"""
+        with self._lock:
+            staged = dict(self.environment_versions)
+            committed: list[dict] = []
+            results: list[dict] = []
+            for item in batch:
+                record, is_new = self._prepare_environment(staged, item, now)
+                if is_new:
+                    staged[(record["id"], record["version"])] = record
+                    committed.append(record)
+                results.append(record)
+            for record in committed:
+                self.environment_versions[(record["id"], record["version"])] = record
+            for record in committed:
+                self._flag_upgrade(record)
+            return results
+
+    def _prepare_environment(self, staged: dict, item: dict,
+                             now: Optional[datetime]) -> tuple[dict, bool]:
+        """在暂存账视图上校验一个环境登记，返回 (记录, 是否新版本)。"""
+        env_id = item["id"]
+        version = item["version"]
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise SandboxError(f"环境版本号必须为正整数：{version!r}")
+        released_at = item["released_at"]
+        if isinstance(released_at, str):
+            released_at = parse_time(released_at)
         record = {
             "id": env_id,
             "version": version,
-            "tools": dict(tools),
+            "tools": deepcopy(dict(item["tools"])),
             "released_at": released_at,
-            "digest": digest(tools),
-            "note": note,
+            "digest": digest(item["tools"]),
+            "note": item.get("note", ""),
+            "replaces": item.get("replaces"),
         }
-        self.environment_versions[(env_id, version)] = record
-        # 升级：给引用旧版本的已评分作业追加风险标记（前向影响、不冻结改写）
-        prior = [v for (eid, v), rec in self.environment_versions.items()
-                 if eid == env_id and v < version]
-        if prior:
-            old_version = max(prior)
-            for assignment in self.assignments.values():
-                fp = assignment.get("fingerprint")
-                if (fp and fp["environment"]["id"] == env_id
-                        and fp["environment"]["version"] == old_version):
-                    self._flag(assignment, {
-                        "type": "工具升级",
-                        "at": released_at.isoformat(),
-                        "detail": note or f"分析环境已升级到 v{version}",
-                        "current": f"{env_id}:v{version}",
-                    })
-        return record
+        existing = staged.get((env_id, version))
+        if existing is not None:
+            diff = _environment_diff(existing, record)
+            if not diff:
+                return existing, False  # 内容完全一致的幂等重放
+            conflict = self._record_conflict(
+                KIND_ENVIRONMENT, {"environment_id": env_id, "version": version},
+                _environment_summary(existing), _environment_summary(record), diff, now)
+            raise VersionConflict(
+                f"分析环境 {env_id}:v{version} 已存在，登记内容不一致"
+                f"（差异：{'、'.join(diff)}）；已拒绝覆盖，冲突审计 {conflict['id']}",
+                self._conflict_detail(conflict))
+        self._check_version_chain(staged, env_id, version, record["replaces"],
+                                  f"分析环境 {env_id}")
+        return record, True
+
+    @staticmethod
+    def _check_version_chain(staged: dict, ident: str, version: int,
+                             replaces: Optional[int], label: str) -> None:
+        """版本链校验：新版本只能显式引用（replaces）所替代的当前最新版本。"""
+        prior = sorted(v for (rid, v) in staged if rid == ident)
+        if not prior:
+            if replaces is not None:
+                raise SandboxError(
+                    f"{label}的首个版本不能声明替代关系（replaces={replaces}）")
+            return
+        latest = prior[-1]
+        if replaces != latest:
+            raise SandboxError(
+                f"{label}当前最新版本为 v{latest}，新版本必须显式 "
+                f"replaces={latest}（收到 replaces={replaces}）")
+        if version <= latest:
+            raise SandboxError(
+                f"{label}新版本号必须大于所替代的 v{latest}（收到 v{version}）")
+
+    def _record_conflict(self, kind: str, key: dict, existing: dict,
+                         incoming: dict, diff: list[str],
+                         now: Optional[datetime]) -> dict:
+        """把被拒绝的覆盖尝试写入冲突审计账与统一审计账。"""
+        at = (now or datetime.now()).isoformat()
+        conflict = {
+            "id": self._new_id("CONFLICT"),
+            "at": at,
+            "kind": kind,
+            "key": key,
+            "differing_fields": list(diff),
+            "existing": existing,
+            "incoming": incoming,
+        }
+        self.conflicts.append(conflict)
+        self.audit.append({
+            "at": at, "action": "版本冲突", "conflict_id": conflict["id"],
+            "kind": kind, "key": key, "differing_fields": list(diff),
+        })
+        return conflict
+
+    @staticmethod
+    def _conflict_detail(conflict: dict) -> dict:
+        return {
+            "conflict_id": conflict["id"],
+            "kind": conflict["kind"],
+            "key": conflict["key"],
+            "differing_fields": conflict["differing_fields"],
+            "existing": conflict["existing"],
+            "incoming": conflict["incoming"],
+        }
+
+    def _flag_erratum(self, record: dict) -> None:
+        """新版本发布：给引用更早版本的已评分作业追加勘误风险标记。
+
+        与装载路径 ``_reconcile_flags`` 使用同一判定（评分之后发布的版本），
+        保证进程恢复后风险标记一致、可重复。
+        """
+        for assignment in self.assignments.values():
+            fp = assignment.get("fingerprint")
+            graded_at = assignment.get("graded_at")
+            if (not fp or graded_at is None
+                    or fp["snapshot"]["case_id"] != record["case_id"]):
+                continue
+            pinned = fp["snapshot"]["version"]
+            if pinned < record["version"] and record["released_at"] > graded_at:
+                self._flag(assignment, {
+                    "type": "病例勘误",
+                    "at": record["released_at"].isoformat(),
+                    "detail": record["erratum_note"]
+                    or f"病例已发布 v{record['version']}，结论基于 v{pinned}",
+                    "current_version": record["version"],
+                })
+
+    def _flag_upgrade(self, record: dict) -> None:
+        """新版本发布：给引用更早镜像版本的已评分作业追加升级风险标记。"""
+        for assignment in self.assignments.values():
+            fp = assignment.get("fingerprint")
+            graded_at = assignment.get("graded_at")
+            if (not fp or graded_at is None
+                    or fp["environment"]["id"] != record["id"]):
+                continue
+            pinned = fp["environment"]["version"]
+            if pinned < record["version"] and record["released_at"] > graded_at:
+                self._flag(assignment, {
+                    "type": "工具升级",
+                    "at": record["released_at"].isoformat(),
+                    "detail": record["note"] or f"分析环境已升级到 v{record['version']}",
+                    "current": f"{record['id']}:v{record['version']}",
+                })
 
     def _environment(self, env_id: str, version: int) -> dict:
         record = self.environment_versions.get((env_id, version))
@@ -770,12 +1060,36 @@ class Sandbox:
         match = not missing and rerun_hash == assignment["result_hash"]
 
         current_fp = self.environment_fingerprint(task, assignment)
+        frozen = assignment["fingerprint"]
+        # 实际读取的快照与环境：与评分时冻结的指纹逐项对照，任何错位都可见
+        actual_read = {
+            "snapshot": {
+                "case_id": snapshot["case_id"],
+                "version": snapshot["version"],
+                "content_hash": snapshot["content_hash"],
+                "released_at": snapshot["released_at"].isoformat(),
+            },
+            "environment": {
+                "id": env["id"],
+                "version": env["version"],
+                "digest": env["digest"],
+                "released_at": env["released_at"].isoformat(),
+            },
+        }
+        read_matches_frozen = (
+            actual_read["snapshot"]["version"] == frozen["snapshot"]["version"]
+            and actual_read["snapshot"]["content_hash"] == frozen["snapshot"]["content_hash"]
+            and actual_read["environment"]["version"] == frozen["environment"]["version"]
+            and actual_read["environment"]["digest"] == frozen["environment"]["digest"])
         return {
             "assignment_id": assignment_id,
             "teacher_id": teacher_id,
             "status": "复现一致" if match else "复现不一致",
-            "frozen_fingerprint": assignment["fingerprint"],
-            "fingerprint_intact": current_fp == assignment["fingerprint"],
+            "frozen_fingerprint": frozen,
+            "fingerprint_intact": current_fp == frozen,
+            "actual_read": actual_read,
+            "read_matches_frozen": read_matches_frozen,
+            "conflicts": self._conflicts_for_task(task),
             "rerun": {
                 "missing_tools": missing,
                 "result_hash": rerun_hash,
@@ -820,6 +1134,7 @@ class Sandbox:
                 "case_id": task["case_id"],
                 "snapshot_version": snapshot["version"],
                 "content_hash": snapshot["content_hash"],
+                "released_at": snapshot["released_at"].isoformat(),
                 "objective_fields": task["objective_fields"],
                 "slice_ids": assignment["slice_ids"],
             },
@@ -842,10 +1157,36 @@ class Sandbox:
             },
             "教师复核": list(assignment["reviews"]),
             "风险标记": list(assignment["risk_flags"]),
+            "版本冲突": self._conflicts_for_task(task),
             "fingerprint": assignment["fingerprint"],
         }
 
     # ---- 查询 -----------------------------------------------------------
+
+    def _conflicts_for_task(self, task: dict) -> list[dict]:
+        """与任务钉住的快照/环境版本直接相关的冲突审计（冲突来源）。"""
+        snapshot_key = {"case_id": task["case_id"], "version": task["snapshot_version"]}
+        env_key = {"environment_id": task["environment_id"],
+                   "version": task["environment_version"]}
+        return [deepcopy(conflict) for conflict in self.conflicts
+                if (conflict["kind"] == KIND_SNAPSHOT and conflict["key"] == snapshot_key)
+                or (conflict["kind"] == KIND_ENVIRONMENT and conflict["key"] == env_key)]
+
+    def snapshot_conflicts(self, case_id: str,
+                           version: Optional[int] = None) -> list[dict]:
+        """某病例（可限定版本）被拒绝的覆盖尝试清单。"""
+        return [deepcopy(conflict) for conflict in self.conflicts
+                if conflict["kind"] == KIND_SNAPSHOT
+                and conflict["key"]["case_id"] == case_id
+                and (version is None or conflict["key"]["version"] == version)]
+
+    def environment_conflicts(self, environment_id: str,
+                              version: Optional[int] = None) -> list[dict]:
+        """某分析镜像（可限定版本）被拒绝的覆盖尝试清单。"""
+        return [deepcopy(conflict) for conflict in self.conflicts
+                if conflict["kind"] == KIND_ENVIRONMENT
+                and conflict["key"]["environment_id"] == environment_id
+                and (version is None or conflict["key"]["version"] == version)]
 
     def assignments_for_case(self, case_id: str) -> list[dict]:
         """列出依赖某病例的全部作业（跨课程），供撤回/勘误时清点影响面。"""
@@ -861,6 +1202,69 @@ class Sandbox:
                     "risk_flags": assignment["risk_flags"],
                 })
         return result
+
+    # ---- 状态导出（进程恢复） ---------------------------------------------
+
+    def dump_state(self) -> dict:
+        """把六账、运行审计与冲突审计导出为可重新装载的状态字典。
+
+        产出可由 :meth:`from_state` 读回；进行中的切片会话与披露决策属于
+        临时运行记录，不纳入恢复范围。导出自持锁，并发登记时也能得到一致快照。
+        """
+        with self._lock:
+            return {
+                "actors": [deepcopy(a) for a in self.actors.values()],
+                "courses": [
+                    {**c, "starts_at": c["starts_at"].isoformat(),
+                     "ends_at": c["ends_at"].isoformat()}
+                    for c in self.courses.values()],
+                "cases": [deepcopy(c) for c in self.cases.values()],
+                "policies": [deepcopy(p) for p in self.policies.values()],
+                "environments": [
+                    {**e, "released_at": e["released_at"].isoformat()}
+                    for e in sorted(self.environment_versions.values(),
+                                    key=lambda e: (e["id"], e["version"]))],
+                "snapshots": [
+                    {**s, "released_at": s["released_at"].isoformat()}
+                    for s in sorted(self.snapshots.values(),
+                                    key=lambda s: (s["case_id"], s["version"]))],
+                "consents": [
+                    {**g, "granted_at": g["granted_at"].isoformat(),
+                     "withdrawn_at": g["withdrawn_at"].isoformat()
+                     if g["withdrawn_at"] else None}
+                    for g in self.consents.values()],
+                "enrollments": [dict(e) for e in self.enrollments],
+                "teachers": [dict(t) for t in self.teacher_courses],
+                "tasks": [
+                    {**t, "created_at": t["created_at"].isoformat()}
+                    for t in self.tasks.values()],
+                "assignments": [self._dump_assignment(a)
+                                for a in self.assignments.values()],
+                "conflicts": deepcopy(self.conflicts),
+                "audit": deepcopy(self.audit),
+                "_seq": self._seq,
+            }
+
+    @staticmethod
+    def _dump_assignment(assignment: dict) -> dict:
+        return {
+            "id": assignment["id"],
+            "task_id": assignment["task_id"],
+            "student_id": assignment["student_id"],
+            "conclusion": assignment["conclusion"],
+            "recipe": deepcopy(assignment["recipe"]),
+            "result_hash": assignment["result_hash"],
+            "status": assignment["status"],
+            "submitted_at": assignment["submitted_at"].isoformat(),
+            "graded_at": assignment["graded_at"].isoformat()
+            if assignment["graded_at"] else None,
+            "grade": assignment["grade"],
+            "fingerprint": deepcopy(assignment["fingerprint"]),
+            "reviews": deepcopy(assignment["reviews"]),
+            "risk_flags": deepcopy(assignment["risk_flags"]),
+            "slice_ids": list(assignment["slice_ids"]),
+            "export_ids": list(assignment["export_ids"]),
+        }
 
 
 def self_check(seed_path: str | Path) -> None:
