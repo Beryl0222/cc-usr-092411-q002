@@ -4,6 +4,8 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from domain import AuthorizationError, NotFound, SandboxError, VersionConflict
+
 SERVICE_ID = "medical-sandbox"
 SERVICE_NAME = "医学教学数据沙箱"
 
@@ -11,6 +13,28 @@ SERVICE_NAME = "医学教学数据沙箱"
 def health_payload():
     """返回稳定的服务身份信息。"""
     return {"status": "ok", "service": SERVICE_ID, "name": SERVICE_NAME}
+
+
+def error_payload(exc):
+    """把领域异常渲染为稳定的 (状态码, JSON 载荷) 错误响应。
+
+    版本冲突返回 409，并说明实际保留（即后续读取）的版本内容摘要、
+    新提交摘要、差异字段与处置结果，与溯源、复现报告中的冲突审计互相印证。
+    """
+    if isinstance(exc, VersionConflict):
+        return 409, {
+            "service": SERVICE_ID,
+            "error": "版本冲突",
+            "message": str(exc),
+            "conflict": exc.detail,
+        }
+    if isinstance(exc, NotFound):
+        return 404, {"service": SERVICE_ID, "error": "记录不存在", "message": str(exc)}
+    if isinstance(exc, AuthorizationError):
+        return 403, {"service": SERVICE_ID, "error": "授权失败", "message": str(exc)}
+    if isinstance(exc, SandboxError):
+        return 400, {"service": SERVICE_ID, "error": "规则违例", "message": str(exc)}
+    return 500, {"service": SERVICE_ID, "error": "内部错误", "message": str(exc)}
 
 
 class Handler(BaseHTTPRequestHandler):

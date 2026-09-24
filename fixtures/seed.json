@@ -63,6 +63,7 @@
       "version": 2,
       "tools": {"python": "3.11.9", "scanpy": "1.10.4", "pandas": "2.2.2"},
       "released_at": "2026-05-01T00:00:00",
+      "replaces": 1,
       "note": "scanpy 升级至 1.10.4，差异表达默认参数变化"
     }
   ],

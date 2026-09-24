@@ -4,9 +4,10 @@
 
 - 课程案例 ``cases``：教学目标、病例与课程的多对多关系；
 - 临床数据快照 ``snapshots``：病例数据的版本化快照，勘误以“新版本”发布，旧版永不改写；
+  同一 (病例, 版本) 只接受内容完全一致的幂等重放，异内容登记被拒绝并记入冲突审计；
 - 数据使用同意 ``consents``：按病例授权（可限定课程），可撤回，撤回即时生效；
 - 脱敏策略 ``policies``：字段变换规则与小样本（k 匿名）阈值；
-- 分析环境 ``environments``：工具镜像的版本与摘要；
+- 分析环境 ``environments``：工具镜像的版本与摘要，登记规则与快照相同；
 - 作业产物 ``assignments``：学生结论、导出申请、评分时冻结的环境指纹与复核记录。
 
 限时切片（``sessions``）与披露决策（``exports``）属于运行记录，不并入上述六账。
@@ -19,7 +20,11 @@
 4. 跨校课程到期后，注册关系与沙箱会话自动收回；
 5. 病例勘误、工具升级只影响之后创建的新任务；已评分作业保留当时环境指纹，
    另以风险标记标出后续变化；同意撤回则即时阻断相关导出并撤回会话；
-6. 任一结论都可溯源到：数据范围、处理步骤、课程授权、教师复核四部分。
+   快照与环境版本一经发布不可改写：同键登记只在内容完全一致时幂等重放，
+   任何差异拒绝覆盖并保留冲突审计；新版本必须显式引用所替代的当前最新版本，
+   批量登记原子提交，并发上传得到唯一结果；
+6. 任一结论都可溯源到：数据范围、处理步骤、课程授权、教师复核四部分，
+   并附实际读取的版本摘要、冻结指纹与相关冲突审计。
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -56,6 +62,18 @@ class AuthorizationError(SandboxError):
     """身份不具备所需能力，或授权已失效。"""
 
 
+class VersionConflict(SandboxError):
+    """同一业务标识与版本号被登记了不同内容：拒绝覆盖并保留冲突审计。
+
+    ``detail`` 携带结构化冲突信息（账本、键位、既有/新提交的内容与登记摘要、
+    差异字段、处置结果），供服务层渲染错误响应、溯源与复现报告引用。
+    """
+
+    def __init__(self, message: str, detail: dict) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
 def parse_time(value: str) -> datetime:
     """解析夹具中的 ISO 时间。"""
     return datetime.fromisoformat(value)
@@ -68,6 +86,13 @@ def canon(value: Any) -> str:
 
 def digest(value: Any, length: int = 16) -> str:
     return hashlib.sha256(canon(value).encode("utf-8")).hexdigest()[:length]
+
+
+def _coerce_time(value: Any) -> datetime:
+    """批量登记接受 datetime 或 ISO 字符串。"""
+    if isinstance(value, datetime):
+        return value
+    return parse_time(value)
 
 
 def _apply_transform(value: Any, rule: str) -> Any:
@@ -101,6 +126,10 @@ class Sandbox:
         self.enrollments: list[dict] = []
         self.teacher_courses: list[dict] = []
         self.audit: list[dict] = []
+        # 冲突审计账：每一次被拒绝的同键异内容登记都在此留痕
+        self.conflicts: list[dict] = []
+        # 版本登记的互斥锁：并发上传同一版本时只有一个胜出，结果唯一
+        self._lock = threading.RLock()
         self._seq = 0
 
     # ---- 装载 -----------------------------------------------------------
@@ -130,6 +159,7 @@ class Sandbox:
             box.add_environment(
                 env["id"], env["version"], env["tools"],
                 released_at=parse_time(env["released_at"]), note=env.get("note", ""),
+                replaces=env.get("replaces"),
             )
         for snapshot in data.get("snapshots", []):
             box.add_snapshot(
@@ -192,6 +222,28 @@ class Sandbox:
                     {"rows": self._project_rows(task), "recipe": recipe})
         self.assignments[assignment["id"]] = assignment
 
+    @staticmethod
+    def _erratum_flag(assignment: dict, snap: dict) -> dict:
+        """勘误风险标记：运行期提交与装载对账共用同一口径。"""
+        return {
+            "type": "病例勘误",
+            "at": snap["released_at"].isoformat(),
+            "detail": snap["erratum_note"]
+            or f"病例已发布 v{snap['version']}，"
+               f"结论基于 v{assignment['fingerprint']['snapshot']['version']}",
+            "current_version": snap["version"],
+        }
+
+    @staticmethod
+    def _upgrade_flag(assignment: dict, rec: dict) -> dict:
+        """工具升级风险标记：运行期提交与装载对账共用同一口径。"""
+        return {
+            "type": "工具升级",
+            "at": rec["released_at"].isoformat(),
+            "detail": rec["note"] or f"分析环境已升级到 v{rec['version']}",
+            "current": f"{rec['id']}:v{rec['version']}",
+        }
+
     def _reconcile_flags(self) -> None:
         """装载后对账：给已评分作业补上评分之后发生的勘误、工具升级、同意撤回标记。"""
         for assignment in self.assignments.values():
@@ -206,25 +258,14 @@ class Sandbox:
                  and snap["released_at"] > graded_at),
                 key=lambda snap: snap["version"])
             for snap in newer_snapshots:
-                self._flag(assignment, {
-                    "type": "病例勘误",
-                    "at": snap["released_at"].isoformat(),
-                    "detail": snap["erratum_note"]
-                    or f"病例已发布 v{snap['version']}，结论基于 v{fp['snapshot']['version']}",
-                    "current_version": snap["version"],
-                })
+                self._flag(assignment, self._erratum_flag(assignment, snap))
             newer_envs = sorted(
                 (rec for (eid, ver), rec in self.environment_versions.items()
                  if eid == task["environment_id"] and ver > fp["environment"]["version"]
                  and rec["released_at"] > graded_at),
                 key=lambda rec: rec["version"])
             for rec in newer_envs:
-                self._flag(assignment, {
-                    "type": "工具升级",
-                    "at": rec["released_at"].isoformat(),
-                    "detail": rec["note"] or f"分析环境已升级到 v{rec['version']}",
-                    "current": f"{rec['id']}:v{rec['version']}",
-                })
+                self._flag(assignment, self._upgrade_flag(assignment, rec))
             for grant in self.consents.values():
                 if grant["case_id"] != task["case_id"]:
                     continue
@@ -265,64 +306,284 @@ class Sandbox:
             "courses": list(courses or []),
         }
 
-    def add_snapshot(self, case_id: str, version: int, rows: list[dict],
-                     identity_fields: list[str], released_at: datetime,
-                     replaces: Optional[int] = None,
-                     erratum_note: str = "") -> dict:
+    # ---- 版本登记：不可变、幂等、显式替代链 -------------------------------
+
+    _LEDGER_LABELS = {"snapshots": "临床数据快照", "environment_versions": "分析环境"}
+
+    @staticmethod
+    def _snapshot_registration(rows, identity_fields, released_at,
+                               replaces, erratum_note) -> dict:
+        """快照登记的完整内容载荷：任一字段变化都视为不同内容。"""
+        return {
+            "rows": rows,
+            "identity_fields": list(identity_fields),
+            "released_at": released_at.isoformat(),
+            "replaces": replaces,
+            "erratum_note": erratum_note,
+        }
+
+    @staticmethod
+    def _environment_registration(tools, released_at, note, replaces) -> dict:
+        """环境登记的完整内容载荷：工具清单、发布时间、说明、替代关系。"""
+        return {
+            "tools": dict(tools),
+            "released_at": released_at.isoformat(),
+            "note": note,
+            "replaces": replaces,
+        }
+
+    @staticmethod
+    def _registration_diff(existing: dict, incoming: dict) -> list[str]:
+        return sorted(field for field in incoming
+                      if canon(existing[field]) != canon(incoming[field]))
+
+    @staticmethod
+    def _version_brief(record: dict, content_hash: str) -> dict:
+        return {
+            "content_hash": content_hash,
+            "registration_hash": record["registration_hash"],
+            "released_at": record["released_at"].isoformat(),
+        }
+
+    def _record_conflict(self, ledger: str, key: dict, subject: str,
+                         existing: dict, incoming: dict,
+                         differing: list[str]) -> None:
+        """拒绝覆盖并保留冲突审计：既有/新提交摘要、差异字段、处置结果。"""
+        record = {
+            "seq": len(self.conflicts) + 1,
+            "ledger": ledger,
+            "key": key,
+            "existing": existing,
+            "incoming": incoming,
+            "differing_fields": differing,
+            "resolution": "拒绝覆盖，保留原版本",
+        }
+        self.conflicts.append(record)
+        raise VersionConflict(
+            f"{self._LEDGER_LABELS[ledger]} {subject} 已登记且内容不一致"
+            f"（差异字段：{'、'.join(differing)}）；拒绝覆盖，"
+            f"冲突已记入审计 #{record['seq']}",
+            detail=record)
+
+    @staticmethod
+    def _check_chain(label: str, existing_versions: list[int],
+                     version: int, replaces: Optional[int]) -> None:
+        """新版本必须显式引用所替代的当前最新版本，且版本号更大。"""
+        if not existing_versions:
+            if replaces is not None:
+                raise NotFound(f"{label}尚无已发布版本，replaces=v{replaces} 无对应版本")
+            return
+        latest = existing_versions[-1]
+        if replaces is None:
+            raise SandboxError(
+                f"{label}已存在 v{latest}，新版本必须显式 replaces={latest}")
+        if replaces not in existing_versions:
+            raise NotFound(f"{label}不存在被引用的版本 v{replaces}")
+        if replaces != latest:
+            raise SandboxError(
+                f"{label}的新版本只能替代当前最新版本 v{latest}，不能替代 v{replaces}")
+        if version <= replaces:
+            raise SandboxError(f"{label}的新版本号 v{version} 必须大于所替代的 v{replaces}")
+
+    def _plan_snapshot(self, staged: dict, case_id: str, version: int,
+                       rows: list[dict], identity_fields: list[str],
+                       released_at: datetime, replaces: Optional[int],
+                       erratum_note: str) -> tuple[dict, str]:
+        """校验一次快照登记，返回 (记录, outcome)；纯校验，不落账。
+
+        outcome 为 ``created``（新版本，待提交）或 ``replayed``（内容完全一致的
+        幂等重放，直接返回原记录）。同键异内容抛出 :class:`VersionConflict`
+        并记冲突审计。
+        """
         if case_id not in self.cases:
             raise NotFound(f"未知病例：{case_id}")
+        registration = self._snapshot_registration(
+            rows, identity_fields, released_at, replaces, erratum_note)
         record = {
             "case_id": case_id,
             "version": version,
             "rows": rows,
-            "identity_fields": identity_fields,
+            "identity_fields": list(identity_fields),
             "released_at": released_at,
             "replaces": replaces,
             "erratum_note": erratum_note,
             "content_hash": digest(rows),
+            "registration_hash": digest(registration),
         }
-        self.snapshots[(case_id, version)] = record
-        # 新版本发布：给引用旧版本的已评分作业追加风险标记
-        if replaces is not None:
-            for assignment in self.assignments.values():
-                fp = assignment.get("fingerprint")
-                if (fp and fp["snapshot"]["case_id"] == case_id
-                        and fp["snapshot"]["version"] == replaces):
-                    self._flag(assignment, {
-                        "type": "病例勘误",
-                        "at": released_at.isoformat(),
-                        "detail": erratum_note or f"病例已发布 v{version}，结论基于 v{replaces}",
-                        "current_version": version,
-                    })
-        return record
+        existing = staged.get((case_id, version))
+        if existing is not None:
+            differing = self._registration_diff(
+                self._snapshot_registration(
+                    existing["rows"], existing["identity_fields"],
+                    existing["released_at"], existing["replaces"],
+                    existing["erratum_note"]),
+                registration)
+            if not differing:
+                return existing, "replayed"
+            self._record_conflict(
+                "snapshots", {"case_id": case_id, "version": version},
+                f"{case_id}:v{version}",
+                existing=self._version_brief(existing, existing["content_hash"]),
+                incoming=self._version_brief(record, record["content_hash"]),
+                differing=differing)
+        prior = sorted(ver for (cid, ver) in staged if cid == case_id)
+        self._check_chain(f"病例 {case_id}", prior, version, replaces)
+        return record, "created"
 
-    def add_environment(self, env_id: str, version: int, tools: dict[str, str],
-                        released_at: datetime, note: str = "") -> dict:
+    def _plan_environment(self, staged: dict, env_id: str, version: int,
+                          tools: dict[str, str], released_at: datetime,
+                          note: str, replaces: Optional[int]) -> tuple[dict, str]:
+        """校验一次环境登记，语义同 :meth:`_plan_snapshot`。"""
+        registration = self._environment_registration(tools, released_at, note, replaces)
         record = {
             "id": env_id,
             "version": version,
             "tools": dict(tools),
             "released_at": released_at,
-            "digest": digest(tools),
             "note": note,
+            "replaces": replaces,
+            "digest": digest(tools),
+            "registration_hash": digest(registration),
         }
-        self.environment_versions[(env_id, version)] = record
-        # 升级：给引用旧版本的已评分作业追加风险标记（前向影响、不冻结改写）
-        prior = [v for (eid, v), rec in self.environment_versions.items()
-                 if eid == env_id and v < version]
-        if prior:
-            old_version = max(prior)
-            for assignment in self.assignments.values():
-                fp = assignment.get("fingerprint")
-                if (fp and fp["environment"]["id"] == env_id
-                        and fp["environment"]["version"] == old_version):
-                    self._flag(assignment, {
-                        "type": "工具升级",
-                        "at": released_at.isoformat(),
-                        "detail": note or f"分析环境已升级到 v{version}",
-                        "current": f"{env_id}:v{version}",
-                    })
-        return record
+        existing = staged.get((env_id, version))
+        if existing is not None:
+            differing = self._registration_diff(
+                self._environment_registration(
+                    existing["tools"], existing["released_at"],
+                    existing["note"], existing["replaces"]),
+                registration)
+            if not differing:
+                return existing, "replayed"
+            self._record_conflict(
+                "environment_versions",
+                {"environment_id": env_id, "version": version},
+                f"{env_id}:v{version}",
+                existing=self._version_brief(existing, existing["digest"]),
+                incoming=self._version_brief(record, record["digest"]),
+                differing=differing)
+        prior = sorted(ver for (eid, ver) in staged if eid == env_id)
+        self._check_chain(f"镜像 {env_id}", prior, version, replaces)
+        return record, "created"
+
+    def _commit_snapshot(self, record: dict) -> None:
+        """落账一个新快照版本，并给引用旧版本的已评分作业追加勘误标记。
+
+        标记口径与 :meth:`_reconcile_flags` 一致（钉住版本 < 新版本且评分时间
+        早于发布时间），保证进程恢复（夹具重建）后风险标记相同。
+        """
+        self.snapshots[(record["case_id"], record["version"])] = record
+        if record["replaces"] is None:
+            return
+        for assignment in self.assignments.values():
+            fp = assignment.get("fingerprint")
+            if (fp and fp["snapshot"]["case_id"] == record["case_id"]
+                    and fp["snapshot"]["version"] < record["version"]
+                    and assignment["graded_at"] < record["released_at"]):
+                self._flag(assignment, self._erratum_flag(assignment, record))
+
+    def _commit_environment(self, record: dict) -> None:
+        """落账一个新环境版本，并给引用旧版本的已评分作业追加升级标记。"""
+        self.environment_versions[(record["id"], record["version"])] = record
+        if record["replaces"] is None:
+            return
+        for assignment in self.assignments.values():
+            fp = assignment.get("fingerprint")
+            if (fp and fp["environment"]["id"] == record["id"]
+                    and fp["environment"]["version"] < record["version"]
+                    and assignment["graded_at"] < record["released_at"]):
+                self._flag(assignment, self._upgrade_flag(assignment, record))
+
+    def add_snapshot(self, case_id: str, version: int, rows: list[dict],
+                     identity_fields: list[str], released_at: datetime,
+                     replaces: Optional[int] = None,
+                     erratum_note: str = "") -> dict:
+        """登记病例快照版本。
+
+        同一 (病例, 版本) 只接受内容完全一致的幂等重放；数据、身份字段、
+        发布时间或替代关系有任何差异都拒绝覆盖并记冲突审计。新版本必须
+        显式 ``replaces`` 当前最新版本。
+        """
+        with self._lock:
+            record, outcome = self._plan_snapshot(
+                self.snapshots, case_id, version, rows, identity_fields,
+                released_at, replaces, erratum_note)
+            if outcome == "created":
+                self._commit_snapshot(record)
+            return record
+
+    def add_environment(self, env_id: str, version: int, tools: dict[str, str],
+                        released_at: datetime, note: str = "",
+                        replaces: Optional[int] = None) -> dict:
+        """登记分析环境版本；不可变与替代链规则同 :meth:`add_snapshot`。"""
+        with self._lock:
+            record, outcome = self._plan_environment(
+                self.environment_versions, env_id, version, tools,
+                released_at, note, replaces)
+            if outcome == "created":
+                self._commit_environment(record)
+            return record
+
+    def register_versions(self, entries: list[dict]) -> list[dict]:
+        """批量登记快照/环境版本：先整体校验，全部通过才提交。
+
+        任一条目冲突或违例则整体拒绝——不留部分版本、不追加风险标记，
+        但被拒的冲突仍记入审计账。进程恢复后重放同一批次是幂等的。
+        条目形如 ``{"kind": "snapshot"|"environment", ...}``，
+        ``released_at`` 接受 datetime 或 ISO 字符串。
+        """
+        with self._lock:
+            staged_snapshots = dict(self.snapshots)
+            staged_environments = dict(self.environment_versions)
+            plans = []
+            for entry in entries:
+                kind = entry.get("kind")
+                if kind == "snapshot":
+                    record, outcome = self._plan_snapshot(
+                        staged_snapshots, entry["case_id"], entry["version"],
+                        entry["rows"], entry.get("identity_fields", []),
+                        _coerce_time(entry["released_at"]),
+                        entry.get("replaces"), entry.get("erratum_note", ""))
+                    key = {"case_id": record["case_id"], "version": record["version"]}
+                    if outcome == "created":
+                        staged_snapshots[(record["case_id"], record["version"])] = record
+                    plans.append(("snapshot", key, record, outcome))
+                elif kind == "environment":
+                    record, outcome = self._plan_environment(
+                        staged_environments, entry["id"], entry["version"],
+                        entry["tools"], _coerce_time(entry["released_at"]),
+                        entry.get("note", ""), entry.get("replaces"))
+                    key = {"environment_id": record["id"], "version": record["version"]}
+                    if outcome == "created":
+                        staged_environments[(record["id"], record["version"])] = record
+                    plans.append(("environment", key, record, outcome))
+                else:
+                    raise SandboxError(f"未知登记类型：{kind!r}")
+            # 提交阶段不会再失败：校验已在暂存视图上整体通过
+            results = []
+            for kind, key, record, outcome in plans:
+                if outcome == "created":
+                    if kind == "snapshot":
+                        self._commit_snapshot(record)
+                    else:
+                        self._commit_environment(record)
+                results.append({"kind": kind, "key": key,
+                                "outcome": outcome, "record": record})
+            return results
+
+    def conflicts_for(self, case_id: Optional[str] = None,
+                      environment_id: Optional[str] = None) -> list[dict]:
+        """按病例/环境筛选冲突审计，供溯源、复现报告与错误响应引用。"""
+        result = []
+        for record in self.conflicts:
+            key = record["key"]
+            if record["ledger"] == "snapshots" and case_id is not None \
+                    and key.get("case_id") == case_id:
+                result.append(record)
+            elif record["ledger"] == "environment_versions" \
+                    and environment_id is not None \
+                    and key.get("environment_id") == environment_id:
+                result.append(record)
+        return result
 
     def _environment(self, env_id: str, version: int) -> dict:
         record = self.environment_versions.get((env_id, version))
@@ -758,6 +1019,7 @@ class Sandbox:
 
         snapshot = self.snapshots[(task["case_id"], task["snapshot_version"])]
         env = self._environment(task["environment_id"], task["environment_version"])
+        frozen = assignment["fingerprint"]
         # 教师在能力层面即被拒绝读取患者身份（独立于课程授权的一道闸）
         actor = self.actors.get(teacher_id, {"roles": []})
         identity_denied = "patient_identity:read" not in actor.get("roles", [])
@@ -767,15 +1029,29 @@ class Sandbox:
                    if step["tool"] not in env["tools"]]
         rerun_rows = self._project_rows(task)
         rerun_hash = digest({"rows": rerun_rows, "recipe": assignment["recipe"]})
-        match = not missing and rerun_hash == assignment["result_hash"]
+        # 实际读取的快照/环境必须与冻结指纹一致，否则复现基础已被动摇
+        snapshot_intact = snapshot["content_hash"] == frozen["snapshot"]["content_hash"]
+        env_intact = env["digest"] == frozen["environment"]["digest"]
+        match = (not missing and rerun_hash == assignment["result_hash"]
+                 and snapshot_intact and env_intact)
 
         current_fp = self.environment_fingerprint(task, assignment)
         return {
             "assignment_id": assignment_id,
             "teacher_id": teacher_id,
             "status": "复现一致" if match else "复现不一致",
-            "frozen_fingerprint": assignment["fingerprint"],
-            "fingerprint_intact": current_fp == assignment["fingerprint"],
+            "frozen_fingerprint": frozen,
+            "actual_read": {
+                "snapshot": {"case_id": snapshot["case_id"],
+                             "version": snapshot["version"],
+                             "content_hash": snapshot["content_hash"],
+                             "registration_hash": snapshot["registration_hash"]},
+                "environment": {"id": env["id"], "version": env["version"],
+                                "digest": env["digest"]},
+            },
+            "snapshot_matches_frozen": snapshot_intact,
+            "environment_matches_frozen": env_intact,
+            "fingerprint_intact": current_fp == frozen,
             "rerun": {
                 "missing_tools": missing,
                 "result_hash": rerun_hash,
@@ -784,6 +1060,8 @@ class Sandbox:
             "identity_access": "拒绝" if identity_denied else "异常放行",
             "identity_fields": snapshot["identity_fields"],
             "risk_flags": assignment["risk_flags"],
+            "conflicts": self.conflicts_for(case_id=task["case_id"],
+                                            environment_id=task["environment_id"]),
         }
 
     # ---- 结论溯源 -------------------------------------------------------
@@ -820,6 +1098,7 @@ class Sandbox:
                 "case_id": task["case_id"],
                 "snapshot_version": snapshot["version"],
                 "content_hash": snapshot["content_hash"],
+                "registration_hash": snapshot["registration_hash"],
                 "objective_fields": task["objective_fields"],
                 "slice_ids": assignment["slice_ids"],
             },
@@ -842,6 +1121,8 @@ class Sandbox:
             },
             "教师复核": list(assignment["reviews"]),
             "风险标记": list(assignment["risk_flags"]),
+            "冲突审计": self.conflicts_for(case_id=task["case_id"],
+                                           environment_id=task["environment_id"]),
             "fingerprint": assignment["fingerprint"],
         }
 
